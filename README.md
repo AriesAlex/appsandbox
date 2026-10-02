@@ -5,6 +5,10 @@
 
 App Sandbox is a virtual machine app for Windows and macOS that's focused on performance and ease of use.
 
+This fork adds native PNG screenshots to the Windows headless API, independent of the viewer window. Download the Windows x64 build from [this fork's releases](https://github.com/AriesAlex/appsandbox/releases/latest). The ZIP retains upstream's signed drivers and runtime resources; the host application and Python SDK are built from this fork.
+
+Use `Path("screen.png").write_bytes(asb.connect().screenshot("win11"))`; see the [API reference](tools/headless-api/README.md#screenshots-windows-host). To build the portable ZIP with Visual Studio 2022 and the Windows SDK, run `tools\make-fork-release.ps1` in PowerShell. Guest data stays in `%ProgramData%\AppSandbox`.
+
 Windows features:
 - Works on Windows 11 Home or Pro, without Hyper-V
 - Windows 11 or Ubuntu 26.04 LTS VM Support

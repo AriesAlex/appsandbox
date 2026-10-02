@@ -25,6 +25,8 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>
+#include <dwmapi.h>
 #pragma warning(pop)
 
 #include <stdio.h>
@@ -44,6 +46,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -2908,6 +2911,166 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);
 
     HeapFree(GetProcessHeap(), 0, display);
+}
+
+/* A new frame-channel connection starts with a full frame. Use it only when
+   no viewer owns the channel; otherwise copy the viewer's existing buffer. */
+static HRESULT capture_full_frame(VmInstance *vm, BYTE **pixels,
+                                  UINT *width, UINT *height, UINT *stride)
+{
+    WSADATA wsa;
+    GUID service;
+    SOCKET socket;
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    ULONGLONG deadline = GetTickCount64() + 10000;
+    int error = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (error) return HRESULT_FROM_WIN32(error);
+
+    hcs_service_guid(vm->os_type, 2, &service);
+    socket = connect_to_hv_service(&vm->runtime_id, &service, 3000);
+    if (socket == INVALID_SOCKET) { WSACleanup(); return hr; }
+
+    while (GetTickCount64() < deadline) {
+        FrameHeader header;
+        UINT32 magic, size;
+        if (!recv_exact(socket, &magic, sizeof(magic))) break;
+        if (magic == CURSOR_MAGIC) {
+            CursorHeader cursor;
+            BYTE discard[4096];
+            if (!recv_exact(socket, (BYTE *)&cursor + sizeof(magic),
+                            sizeof(cursor) - sizeof(magic))) break;
+            if (cursor.shape_data_size > MAX_CURSOR_SIZE) {
+                hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                break;
+            }
+            size = cursor.shape_updated ? cursor.shape_data_size : 0;
+            while (size) {
+                UINT32 part = size < sizeof(discard) ? size : sizeof(discard);
+                if (!recv_exact(socket, discard, (int)part)) goto done;
+                size -= part;
+            }
+            continue;
+        }
+        if (magic != FRAME_MAGIC) { hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA); break; }
+        if (!recv_exact(socket, (BYTE *)&header + sizeof(magic),
+                        sizeof(header) - sizeof(magic))) break;
+        if (!recv_exact(socket, &size, sizeof(size))) break;
+        if (!header.width || !header.height || header.width > DEFAULT_WIDTH ||
+            header.height > DEFAULT_HEIGHT || header.stride < header.width * 4 ||
+            header.dirty_rect_count || size > MAX_FRAME_DATA_SIZE ||
+            (UINT64)header.stride * header.height != size) {
+            hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+            break;
+        }
+        *pixels = (BYTE *)HeapAlloc(GetProcessHeap(), 0, size);
+        if (!*pixels) { hr = E_OUTOFMEMORY; break; }
+        if (!recv_exact(socket, *pixels, (int)size)) break;
+        *width = header.width; *height = header.height; *stride = header.stride;
+        hr = S_OK;
+        break;
+    }
+done:
+    shutdown(socket, SD_BOTH);
+    closesocket(socket);
+    WSACleanup();
+    return hr;
+}
+
+static HRESULT encode_png(BYTE *pixels, UINT width, UINT height, UINT stride,
+                          BYTE **png, ULONG *size)
+{
+    IWICImagingFactory *factory = NULL;
+    IWICBitmapEncoder *encoder = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    IStream *stream = NULL;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    STATSTG stat;
+    LARGE_INTEGER zero = {0};
+    ULONG read = 0;
+    UINT x, y;
+    HRESULT init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    HRESULT hr;
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) return init;
+
+    /* Display pixels are opaque even if their unused alpha bytes are zero. */
+    for (y = 0; y < height; y++)
+        for (x = 0; x < width; x++) pixels[y * stride + x * 4 + 3] = 255;
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IWICImagingFactory, (void **)&factory);
+    if (FAILED(hr)) goto done;
+    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
+    if (FAILED(hr)) goto done;
+    hr = IWICImagingFactory_CreateEncoder(factory, &GUID_ContainerFormatPng, NULL, &encoder);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapEncoder_Initialize(encoder, stream, WICBitmapEncoderNoCache);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapEncoder_CreateNewFrame(encoder, &frame, NULL);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapFrameEncode_Initialize(frame, NULL);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapFrameEncode_SetSize(frame, width, height);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapFrameEncode_SetPixelFormat(frame, &format);
+    if (FAILED(hr)) goto done;
+    if (memcmp(&format, &GUID_WICPixelFormat32bppBGRA, sizeof(format))) {
+        hr = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+        goto done;
+    }
+    hr = IWICBitmapFrameEncode_WritePixels(frame, height, stride, stride * height, pixels);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapFrameEncode_Commit(frame);
+    if (FAILED(hr)) goto done;
+    hr = IWICBitmapEncoder_Commit(encoder);
+    if (FAILED(hr)) goto done;
+    hr = stream->lpVtbl->Stat(stream, &stat, STATFLAG_NONAME);
+    if (FAILED(hr)) goto done;
+    if (stat.cbSize.HighPart || !stat.cbSize.LowPart) { hr = E_FAIL; goto done; }
+    *png = (BYTE *)HeapAlloc(GetProcessHeap(), 0, stat.cbSize.LowPart);
+    if (!*png) { hr = E_OUTOFMEMORY; goto done; }
+    hr = stream->lpVtbl->Seek(stream, zero, STREAM_SEEK_SET, NULL);
+    if (FAILED(hr)) goto done;
+    hr = stream->lpVtbl->Read(stream, *png, stat.cbSize.LowPart, &read);
+    if (SUCCEEDED(hr) && read != stat.cbSize.LowPart) hr = E_FAIL;
+    if (SUCCEEDED(hr)) *size = read;
+done:
+    if (frame) IWICBitmapFrameEncode_Release(frame);
+    if (encoder) IWICBitmapEncoder_Release(encoder);
+    if (stream) stream->lpVtbl->Release(stream);
+    if (factory) IWICImagingFactory_Release(factory);
+    if (SUCCEEDED(init)) CoUninitialize();
+    return hr;
+}
+
+HRESULT vm_display_idd_screenshot(VmInstance *vm, VmDisplayIdd *display,
+                                  BYTE **png, ULONG *size)
+{
+    BYTE *pixels = NULL;
+    UINT width = 0, height = 0, stride = 0;
+    HRESULT hr;
+    *png = NULL; *size = 0;
+    if (display) {
+        EnterCriticalSection(&display->frame_cs);
+        if (!display->recv_count || !display->frame_connected) {
+            LeaveCriticalSection(&display->frame_cs);
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        }
+        width = display->frame_width; height = display->frame_height;
+        stride = display->frame_stride;
+        pixels = (BYTE *)HeapAlloc(GetProcessHeap(), 0, stride * height);
+        if (pixels) memcpy(pixels, display->frame_buf, stride * height);
+        LeaveCriticalSection(&display->frame_cs);
+        hr = pixels ? S_OK : E_OUTOFMEMORY;
+    } else {
+        hr = capture_full_frame(vm, &pixels, &width, &height, &stride);
+    }
+    if (SUCCEEDED(hr)) hr = encode_png(pixels, width, height, stride, png, size);
+    if (pixels) HeapFree(GetProcessHeap(), 0, pixels);
+    if (FAILED(hr) && *png) {
+        HeapFree(GetProcessHeap(), 0, *png);
+        *png = NULL;
+    }
+    return hr;
 }
 
 BOOL vm_display_idd_is_open(VmDisplayIdd *display)

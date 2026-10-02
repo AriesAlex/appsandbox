@@ -15,6 +15,11 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
 void vm_display_idd_destroy(VmDisplayIdd *display);
 BOOL vm_display_idd_is_open(VmDisplayIdd *display);
 
+/* Capture without opening or focusing a window. An existing viewer keeps its
+   frame connection. The caller frees the PNG with HeapFree(GetProcessHeap()). */
+HRESULT vm_display_idd_screenshot(VmInstance *vm, VmDisplayIdd *display,
+                                  BYTE **png, ULONG *size);
+
 /* Bring an already-open display window to the foreground/focus.
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);

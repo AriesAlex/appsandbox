@@ -24,7 +24,7 @@ c.delete_vm("dev")
 `sudo AppSandbox.app/Contents/MacOS/AppSandbox --headless` (macOS) starts a
 **single-owner daemon**. It hosts the AppSandbox core (`appsandbox_core.dll` /
 `AppSandboxCore.framework`) for the lifetime of the process and exposes the
-SAME Docker-style local HTTP/JSON API on both platforms. The daemon *owns* the
+shared Docker-style local HTTP/JSON lifecycle API on both platforms. The daemon *owns* the
 VMs: they run as long as it runs (exit terminates them), and the API is just a
 remote control for the same core the GUI drives.
 
@@ -74,10 +74,11 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | **macOS guest** | ❌ | ✅ (Apple silicon) |
 | Snapshots & branches | ✅ | ❌ `501` |
 | Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
+| Screenshots (`/vms/{n}/screenshot`) | ✅ | ❌ |
 | Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
-Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
+`snapshots`/`templates` are advertised in the `capabilities` object; Windows also advertises `screenshots`. Guest
 OS is host-fixed (Windows host → Windows + Linux; macOS host → macOS + Windows), so
 a client picks its `osType` from `version()["hostOs"]`, not from `capabilities`.
 
@@ -245,6 +246,27 @@ connection can never make you miss a transition.
 - `wait_online(name, timeout=900)` — shorthand for `wait(name, {"online"})`.
 
 `asb.RUNNING_STATES == {"booting", "online"}` — the powered-on states.
+
+### Screenshots (Windows host)
+
+`GET /v1/vms/{name}/screenshot` returns `image/png` at the guest display's
+native resolution. It requires the same bearer token as the other VM routes.
+The VM and virtual display driver must be ready; no interactive host desktop,
+SSH connection, or display window is required.
+
+```python
+from pathlib import Path
+Path("screen.png").write_bytes(c.screenshot("dev"))
+```
+
+When a viewer is open, capture copies its latest received frame without
+opening another frame connection or changing focus. Otherwise it connects to
+the display channel, reads the initial full frame, and immediately disconnects.
+Input, audio, and clipboard channels are untouched. The PNG contains the desktop
+pixels; the separately transported hardware cursor is not composited into it.
+
+Errors: `409 not_running`, `409 display_not_ready`, or
+`503 screenshot_failed` with an HRESULT if capture/encoding fails.
 
 ### Display
 

@@ -14,9 +14,9 @@ Then:
 
 Stdlib only (urllib) -- no third-party dependencies. The daemon exposes a
 Docker-style local HTTP/JSON API over loopback; the discovery file gives us the
-port + bearer token so connect() takes no arguments. The API is IDENTICAL on
-both platforms; feature differences (snapshots/templates are Windows-only) are
-advertised in version()["capabilities"] and those routes return 501 on macOS.
+port + bearer token so connect() takes no arguments. The shared lifecycle API runs on
+both platforms; Windows-only snapshots/templates and screenshots are
+advertised in version()["capabilities"]. Screenshots are available on Windows.
 """
 import json
 import os
@@ -62,7 +62,7 @@ class Client:
         self.base = endpoint.rstrip("/") + "/v1"
         self.token = token
 
-    def _req(self, method, path, body=None, timeout=60):
+    def _req(self, method, path, body=None, timeout=60, binary=False):
         url = self.base + path
         data = None
         if body is not None:
@@ -75,8 +75,10 @@ class Client:
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read().decode("utf-8")
-                return r.status, (json.loads(raw) if raw else {})
+                raw = r.read()
+                if binary:
+                    return r.status, raw
+                return r.status, (json.loads(raw.decode("utf-8")) if raw else {})
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8")
             return e.code, (json.loads(raw) if raw else {})
@@ -141,6 +143,13 @@ class Client:
         returns 409 "no_display"). Returns (status, body); status() reports
         displayOpen, which also goes false if the user closes the window."""
         return self._req("POST", "/vms/%s/display" % name)
+    def screenshot(self, name):
+        """Return PNG bytes without opening a display window (Windows host)."""
+        code, body = self._req("GET", "/vms/%s/screenshot" % name, binary=True)
+        if code != 200:
+            raise RuntimeError("Screenshot failed (%s): %s" % (code, body))
+        return body
+
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the

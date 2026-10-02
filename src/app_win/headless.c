@@ -320,7 +320,7 @@ static HTTP_URL_GROUP_ID      g_url_group;
 static char                   g_token[48];
 
 static void send_response(HTTP_REQUEST_ID reqId, USHORT status, const char *reason,
-                          const char *ctype, const char *body)
+                          const char *ctype, const void *body, ULONG size)
 {
     HTTP_RESPONSE resp; HTTP_DATA_CHUNK chunk; ULONG sent = 0;
     RtlZeroMemory(&resp, sizeof(resp));
@@ -328,17 +328,19 @@ static void send_response(HTTP_REQUEST_ID reqId, USHORT status, const char *reas
     resp.pReason = reason; resp.ReasonLength = (USHORT)strlen(reason);
     resp.Headers.KnownHeaders[HttpHeaderContentType].pRawValue = ctype;
     resp.Headers.KnownHeaders[HttpHeaderContentType].RawValueLength = (USHORT)strlen(ctype);
+    resp.Headers.KnownHeaders[HttpHeaderCacheControl].pRawValue = "no-store";
+    resp.Headers.KnownHeaders[HttpHeaderCacheControl].RawValueLength = 8;
     if (body) {
         chunk.DataChunkType = HttpDataChunkFromMemory;
         chunk.FromMemory.pBuffer = (PVOID)body;
-        chunk.FromMemory.BufferLength = (ULONG)strlen(body);
+        chunk.FromMemory.BufferLength = size;
         resp.EntityChunkCount = 1; resp.pEntityChunks = &chunk;
     }
     HttpSendHttpResponse(g_req_queue, reqId, 0, &resp, NULL, &sent, NULL, 0, NULL, NULL);
 }
 
 static void send_json(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *body)
-{ send_response(id, status, reason, "application/json", body); }
+{ send_response(id, status, reason, "application/json", body, body ? (ULONG)strlen(body) : 0); }
 
 static void send_err(HTTP_REQUEST_ID id, USHORT status, const char *reason, const char *code, const char *msg)
 {
@@ -566,7 +568,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"screenshots\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -914,6 +916,40 @@ static int handle_request(PHTTP_REQUEST req)
                 (unsigned long)v->ssh_port, user, ssh_rep, v->ssh_enabled ? "true" : "false",
                 v->ssh_key_deployed ? "true" : "false");
             send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
+
+        if (wcscmp(sub, L"screenshot") == 0) {
+            VmInstance *v = asb_vm_instance(vm);
+            DisplayEntry *entry;
+            BYTE *png = NULL;
+            ULONG size = 0;
+            HRESULT hr;
+            if (verb != HttpVerbGET) {
+                send_err(req->RequestId, 405, "Method Not Allowed", "method", "use GET to capture a PNG");
+                return 0;
+            }
+            if (!v || !v->running) {
+                send_err(req->RequestId, 409, "Conflict", "not_running", "VM is not running");
+                return 0;
+            }
+            if (!asb_vm_idd_ready(vm)) {
+                send_err(req->RequestId, 409, "Conflict", "display_not_ready", "the virtual display driver is not ready");
+                return 0;
+            }
+            display_reap_stale(v->unique_id);
+            entry = display_find(v->unique_id);
+            hr = vm_display_idd_screenshot(v, entry ? entry->disp : NULL, &png, &size);
+            if (FAILED(hr)) {
+                char body[192];
+                sprintf_s(body, sizeof(body),
+                          "{\"error\":{\"code\":\"screenshot_failed\",\"hr\":\"0x%08lX\",\"message\":\"could not capture a frame\"}}",
+                          (unsigned long)hr);
+                send_json(req->RequestId, 503, "Service Unavailable", body);
+            } else {
+                send_response(req->RequestId, 200, "OK", "image/png", png, size);
+                HeapFree(GetProcessHeap(), 0, png);
+            }
             return 0;
         }
 
